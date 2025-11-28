@@ -1,0 +1,36 @@
+generator client {
+  provider = "prisma-client"
+  output   = "./generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model DriveFile {
+  id           String            @id
+  name         String
+  mimeType     String?
+  parents      String?
+  size         Int?
+  modifiedTime DateTime?
+  createdTime  DateTime?
+  isFolder     Boolean           @default(false)
+  trashed      Boolean           @default(false)
+  permissions  DrivePermission[]
+
+  @@map("DriveFile")
+}
+
+model DrivePermission {
+  id                 String    @id @default(cuid())
+  fileId             String
+  type               String
+  role               String
+  emailAddress       String?
+  domain             String?
+  allowFileDiscovery Boolean   @default(false)
+  file               DriveFile @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@map("DrivePermission")
+}
