@@ -1,7 +1,8 @@
-import { PrismaClient } from '@prisma/client';
+import 'dotenv/config';
+import { PrismaPg } from '@prisma/adapter-pg';
+import { PrismaClient } from '../../prisma/generated/prisma/client';
 
-// In Prisma 7+, the database URL must be passed to the PrismaClient constructor
-// instead of being defined in the schema.prisma file
-const prisma = new PrismaClient({});
+const connectionString = `${process.env.DATABASE_URL}`;
 
-export default prisma;
+const adapter = new PrismaPg({ connectionString });
+export const prisma = new PrismaClient({ adapter });

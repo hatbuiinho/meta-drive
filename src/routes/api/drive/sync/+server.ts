@@ -1,319 +1,156 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import GoogleDriveService, { type DriveFileData, type DrivePermissionData } from '$lib/google-drive';
-import prisma from '$lib/prisma';
+import GoogleDriveSyncService from '$lib/google-drive-sync';
+import { driveSyncEmitter, type SyncProgressEvent, type SyncStats } from '$lib/sync-events';
 
-export const POST: RequestHandler = async ({ url }) => {
-  const startTime = Date.now();
-  let totalFilesProcessed = 0;
-  let totalPermissionsProcessed = 0;
+export const GET: RequestHandler = async ({ url }) => {
+  const action = url.searchParams.get('action');
+  const folderId = url.searchParams.get('folderId') || undefined;
 
+  if (action === 'start') {
+    return handleStartSync(folderId);
+  } else if (action === 'progress') {
+    return handleProgressStream();
+  }
+
+  return json(
+    { error: 'Invalid action. Use ?action=start or ?action=progress' },
+    { status: 400 }
+  );
+};
+
+/**
+ * Start the sync process
+ */
+async function handleStartSync(folderId?: string) {
   try {
-    console.log('🚀 Starting comprehensive Google Drive metadata sync...');
+    console.log('🚀 Starting Google Drive sync...');
 
-    // Get optional folder ID from query parameters
-    const folderId = url.searchParams.get('folderId') || process.env.GOOGLE_DRIVE_FOLDER_ID;
-    console.log(`📁 Target folder: ${folderId || 'All files'}`);
-
-    // Initialize Google Drive service
-    const driveService = new GoogleDriveService();
-
-    // Step 1: Sync all data from Google Drive
-    console.log('📥 Fetching data from Google Drive...');
-    const { files, allPermissions } = await driveService.syncAllData(folderId || undefined);
-
-    console.log(`📊 Retrieved ${files.length} files and ${allPermissions.length} permissions from Google Drive`);
-
-    // Step 2: Clean up orphaned records before syncing new data
-    console.log('🧹 Cleaning up orphaned records...');
-    await cleanupOrphanedRecords(files);
-
-    // Step 3: Sync DriveFile records with transaction for consistency
-    console.log('💾 Syncing DriveFile records...');
-    const filesResult = await syncDriveFiles(files);
-    totalFilesProcessed = filesResult.total;
-
-    // Step 4: Sync DrivePermission records with transaction
-    console.log('🔐 Syncing DrivePermission records...');
-    const permissionsResult = await syncDrivePermissions(allPermissions, files);
-    totalPermissionsProcessed = permissionsResult.total;
-
-    // Step 5: Verify data integrity
-    console.log('✅ Verifying data integrity...');
-    const integrityCheck = await verifyDataIntegrity();
-
-    // Calculate processing time
-    const endTime = Date.now();
-    const processingTime = endTime - startTime;
-
-    // Return comprehensive sync statistics
-    const result = {
-      success: true,
-      sync: {
-        metadata: {
-          folderId: folderId || 'all',
-          processingTimeMs: processingTime,
-          timestamp: new Date().toISOString(),
-        },
-        files: {
-          total: files.length,
-          upserted: filesResult.upserted,
-          updated: filesResult.updated,
-          skipped: filesResult.skipped,
-          errors: filesResult.errors,
-          folders: files.filter(f => f.isFolder).length,
-          regularFiles: files.filter(f => !f.isFolder).length,
-        },
-        permissions: {
-          total: allPermissions.length,
-          upserted: permissionsResult.upserted,
-          updated: permissionsResult.updated,
-          skipped: permissionsResult.skipped,
-          errors: permissionsResult.errors,
-          cleaned: permissionsResult.cleaned,
-        },
-        integrity: integrityCheck,
-      },
-      database: {
-        totalDriveFiles: await prisma.driveFile.count(),
-        totalDrivePermissions: await prisma.drivePermission.count(),
-      }
-    };
-
-    console.log('🎉 Sync completed successfully:', {
-      filesProcessed: totalFilesProcessed,
-      permissionsProcessed: totalPermissionsProcessed,
-      processingTime: `${processingTime}ms`,
+    // Start sync in background (don't await to allow SSE to work)
+    const syncService = new GoogleDriveSyncService();
+    
+    // Start sync and return immediately
+    syncService.startSync(folderId).catch(error => {
+      console.error('Sync failed:', error);
     });
 
-    return json(result);
+    return json({
+      success: true,
+      message: 'Sync started successfully',
+      folderId: folderId || 'all',
+      timestamp: new Date().toISOString(),
+    });
 
   } catch (error) {
-    console.error('❌ Error during Google Drive sync:', error);
+    console.error('Error starting sync:', error);
     
     return json(
       {
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error occurred',
+        error: error instanceof Error ? error.message : 'Failed to start sync',
         timestamp: new Date().toISOString(),
-        processed: {
-          files: totalFilesProcessed,
-          permissions: totalPermissionsProcessed,
-        },
       },
       { status: 500 }
     );
   }
-};
-
-/**
- * Clean up orphaned permissions and files that no longer exist in Google Drive
- */
-async function cleanupOrphanedRecords(currentFiles: DriveFileData[]) {
-  const currentFileIds = currentFiles.map(f => f.id);
-  
-  // Clean up orphaned permissions
-  const orphanedPermissions = await prisma.drivePermission.findMany({
-    where: {
-      fileId: {
-        notIn: currentFileIds
-      }
-    }
-  });
-
-  if (orphanedPermissions.length > 0) {
-    console.log(`🗑️ Cleaning up ${orphanedPermissions.length} orphaned permissions`);
-    await prisma.drivePermission.deleteMany({
-      where: {
-        id: {
-          in: orphanedPermissions.map(p => p.id)
-        }
-      }
-    });
-  }
-
-  // Clean up orphaned files (files not in Google Drive anymore)
-  const orphanedFiles = await prisma.driveFile.findMany({
-    where: {
-      id: {
-        notIn: currentFileIds
-      }
-    }
-  });
-
-  if (orphanedFiles.length > 0) {
-    console.log(`🗑️ Cleaning up ${orphanedFiles.length} orphaned files`);
-    await prisma.driveFile.deleteMany({
-      where: {
-        id: {
-          in: orphanedFiles.map(f => f.id)
-        }
-      }
-    });
-  }
 }
 
 /**
- * Sync DriveFile records with comprehensive error handling
+ * Server-Sent Events endpoint for real-time progress updates
  */
-async function syncDriveFiles(files: DriveFileData[]) {
-  let upserted = 0;
-  let updated = 0;
-  let skipped = 0;
-  let errors = 0;
+function handleProgressStream() {
+  const encoder = new TextEncoder();
 
-  // Use transaction for batch consistency
-  await prisma.$transaction(async (tx) => {
-    for (const fileData of files) {
-      try {
-        const existingFile = await tx.driveFile.findUnique({
-          where: { id: fileData.id }
-        });
+  const stream = new ReadableStream({
+    start(controller) {
+      console.log('🔗 SSE client connected for progress updates');
 
-        const driveFileData = {
-          id: fileData.id,
-          name: fileData.name || 'Untitled',
-          mimeType: fileData.mimeType || null,
-          parents: fileData.parents ? fileData.parents.join(',') : null,
-          size: fileData.size || null,
-          modifiedTime: fileData.modifiedTime || null,
-          createdTime: fileData.createdTime || null,
-          isFolder: fileData.isFolder || false,
-          trashed: fileData.trashed || false,
-        };
+      // Send initial connection message
+      const connectMessage = `data: ${JSON.stringify({ 
+        type: 'connected', 
+        message: 'SSE connection established',
+        timestamp: new Date().toISOString()
+      })}\n\n`;
+      controller.enqueue(encoder.encode(connectMessage));
 
-        if (existingFile) {
-          // Check if data has changed before updating
-          const hasChanges = JSON.stringify(existingFile) !== JSON.stringify({
-            ...existingFile,
-            ...driveFileData
-          });
+      // Event handlers
+      const progressHandler = (event: SyncProgressEvent) => {
+        const message = `data: ${JSON.stringify(event)}\n\n`;
+        controller.enqueue(encoder.encode(message));
+        console.log('📡 Broadcasted progress:', event);
+      };
 
-          if (hasChanges) {
-            await tx.driveFile.update({
-              where: { id: fileData.id },
-              data: driveFileData,
-            });
-            updated++;
-          } else {
-            skipped++;
-          }
-        } else {
-          await tx.driveFile.create({
-            data: driveFileData,
-          });
-          upserted++;
-        }
-      } catch (error) {
-        console.error(`❌ Error upserting file ${fileData.id}:`, error);
-        errors++;
-      }
-    }
+      const syncStartHandler = () => {
+        const message = `data: ${JSON.stringify({ 
+          type: 'sync_start', 
+          message: 'Sync process started',
+          timestamp: new Date().toISOString()
+        })}\n\n`;
+        controller.enqueue(encoder.encode(message));
+        console.log('📡 Broadcasted sync start');
+      };
+
+      const syncCompleteHandler = (stats: SyncStats) => {
+        const message = `data: ${JSON.stringify({ 
+          type: 'sync_complete', 
+          message: 'Sync process completed',
+          stats,
+          timestamp: new Date().toISOString()
+        })}\n\n`;
+        controller.enqueue(encoder.encode(message));
+        console.log('📡 Broadcasted sync complete:', stats);
+      };
+
+      const syncErrorHandler = (error: string) => {
+        const message = `data: ${JSON.stringify({ 
+          type: 'sync_error', 
+          message: 'Sync process failed',
+          error,
+          timestamp: new Date().toISOString()
+        })}\n\n`;
+        controller.enqueue(encoder.encode(message));
+        console.log('📡 Broadcasted sync error:', error);
+      };
+
+      // Register event listeners
+      driveSyncEmitter.on('progress', progressHandler);
+      driveSyncEmitter.on('sync_start', syncStartHandler);
+      driveSyncEmitter.on('sync_complete', syncCompleteHandler);
+      driveSyncEmitter.on('sync_error', syncErrorHandler);
+
+      // Send keepalive ping every 30 seconds
+      const keepAliveInterval = setInterval(() => {
+        const pingMessage = `data: ${JSON.stringify({ 
+          type: 'ping', 
+          timestamp: new Date().toISOString()
+        })}\n\n`;
+        controller.enqueue(encoder.encode(pingMessage));
+      }, 30000);
+
+      // Cleanup function
+      const cleanup = () => {
+        console.log('🔗 SSE client disconnected');
+        clearInterval(keepAliveInterval);
+        driveSyncEmitter.off('progress', progressHandler);
+        driveSyncEmitter.off('sync_start', syncStartHandler);
+        driveSyncEmitter.off('sync_complete', syncCompleteHandler);
+        driveSyncEmitter.off('sync_error', syncErrorHandler);
+        controller.close();
+      };
+
+      // Handle client disconnect
+      // Note: SvelteKit handles stream cleanup automatically
+      return cleanup;
+    },
   });
 
-  return { upserted, updated, skipped, errors, total: files.length };
-}
-
-/**
- * Sync DrivePermission records with comprehensive error handling
- */
-async function syncDrivePermissions(permissions: DrivePermissionData[], files: DriveFileData[]) {
-  let upserted = 0;
-  let updated = 0;
-  let skipped = 0;
-  let errors = 0;
-  const cleaned = 0;
-
-  // Filter permissions to only include those for files that exist
-  const validFileIds = new Set(files.map(f => f.id));
-  const validPermissions = permissions.filter(p => validFileIds.has(p.fileId));
-
-  // Use transaction for batch consistency
-  await prisma.$transaction(async (tx) => {
-    for (const permissionData of validPermissions) {
-      try {
-        const existingPermission = await tx.drivePermission.findUnique({
-          where: { id: permissionData.id }
-        });
-
-        const drivePermissionData = {
-          id: permissionData.id,
-          fileId: permissionData.fileId,
-          type: permissionData.type || 'user',
-          role: permissionData.role || 'reader',
-          emailAddress: permissionData.emailAddress || null,
-          domain: permissionData.domain || null,
-          allowFileDiscovery: permissionData.allowFileDiscovery || false,
-        };
-
-        if (existingPermission) {
-          // Check if data has changed before updating
-          const hasChanges = JSON.stringify(existingPermission) !== JSON.stringify({
-            ...existingPermission,
-            ...drivePermissionData
-          });
-
-          if (hasChanges) {
-            await tx.drivePermission.update({
-              where: { id: permissionData.id },
-              data: drivePermissionData,
-            });
-            updated++;
-          } else {
-            skipped++;
-          }
-        } else {
-          await tx.drivePermission.create({
-            data: drivePermissionData,
-          });
-          upserted++;
-        }
-      } catch (error) {
-        console.error(`❌ Error upserting permission ${permissionData.id}:`, error);
-        errors++;
-      }
-    }
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': 'Cache-Control',
+    },
   });
-
-  return { upserted, updated, skipped, errors, cleaned, total: validPermissions.length };
-}
-
-/**
- * Verify data integrity after sync
- */
-async function verifyDataIntegrity() {
-  try {
-    // Check for orphaned permissions by finding permissions with non-existent files
-    const orphanedPermissions = await prisma.drivePermission.count({
-      where: {
-        fileId: {
-          notIn: (await prisma.driveFile.findMany({ select: { id: true } })).map(f => f.id)
-        }
-      }
-    });
-
-    // Check for invalid file references (files with permissions pointing to non-existent files)
-    const allFileIds = new Set((await prisma.driveFile.findMany({ select: { id: true } })).map(f => f.id));
-    const permissionsWithInvalidFiles = await prisma.drivePermission.count({
-      where: {
-        fileId: {
-          notIn: Array.from(allFileIds)
-        }
-      }
-    });
-
-    return {
-      orphanedPermissions,
-      invalidFileReferences: permissionsWithInvalidFiles,
-      isConsistent: orphanedPermissions === 0,
-    };
-  } catch (error) {
-    console.error('❌ Error during integrity check:', error);
-    return {
-      orphanedPermissions: -1,
-      invalidFileReferences: -1,
-      isConsistent: false,
-      error: error instanceof Error ? error.message : 'Unknown error'
-    };
-  }
 }
